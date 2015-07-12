@@ -1,7 +1,7 @@
 ## MQTTwarn image
 
 Subscribe to MQTT topics (with wildcards) and notifiy pluggable services.  
-*Project from https://github.com/jpmens/mqttwarn*
+*Project from https://github.com/jpmens/mqttwarn.*
 
 ### Expose
 
@@ -16,7 +16,10 @@ See mqttwarn.ini.sample.
 ### Container Quickstart
 
 Run MQTTwarn with link to mosquitto container:  
-`docker run -d --link mosquitto:mosquitto --name=mqttwarn sourceperl/mqttwarn`
+`docker run -d --link mosquitto:mosquitto --name=mqttwarn sourceperl/mqttwarn`  
+
+*Mqttwarn is run as non-root user "mqttwarn" on container and also on the host
+system.*
 
 ### Build images
 
