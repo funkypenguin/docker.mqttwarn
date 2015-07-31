@@ -4,12 +4,13 @@ MAINTAINER sourceperl <loic.celine@free.fr>
 
 # build /opt/mqttwarn
 RUN mkdir -p /opt/mqttwarn
+RUN mkdir -p /opt/mqttwarn/conf
 WORKDIR /opt/mqttwarn/
 RUN mkdir -p /opt/mqttwarn/services
-ADD services/ /opt/mqttwarn/services/
-ADD mqttwarn.ini /opt/mqttwarn/
-ADD mqttwarn.py /opt/mqttwarn/
-ADD requirements.txt /opt/mqttwarn/
+COPY services/ /opt/mqttwarn/services/
+COPY conf /opt/mqttwarn/conf/
+COPY mqttwarn.py /opt/mqttwarn/
+COPY requirements.txt /opt/mqttwarn/
 
 # install python library
 RUN pip install -r requirements.txt
@@ -20,6 +21,12 @@ RUN chown -R mqttwarn /opt/mqttwarn
 
 # process run as mqttwarn user
 USER mqttwarn
+
+# conf file from host
+VOLUME ["/opt/mqttwarn/conf"]
+
+# set conf path
+ENV MQTTWARNINI="/opt/mqttwarn/conf/mqttwarn.ini"
 
 # run process
 CMD python mqttwarn.py
