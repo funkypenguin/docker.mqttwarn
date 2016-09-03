@@ -6,6 +6,7 @@ import logging
 import signal
 import sys
 import time
+import types
 from datetime import datetime
 try:
     import json
@@ -85,6 +86,8 @@ class Config(RawConfigParser):
         self.loglevel     = 'DEBUG'
 
         self.functions    = None
+        self.num_workers  = 1
+
         self.directory    = '.'
         self.ca_certs     = None
         self.tls_version  = None
@@ -215,6 +218,24 @@ class Config(RawConfigParser):
 
         return val
 
+    def topic_target_list(self, name, topic, data):
+        """
+        Attempt to invoke function `name' loaded from the
+        `functions' Python package for computing dynamic
+        topic subscription targets.
+        Pass MQTT topic and transformation data.
+        """
+
+        val = None
+
+        try:
+            func = getattr(__import__(cf.functions, fromlist=[name]), name)
+            val = func(topic=topic, data=data, srv=srv)
+        except:
+            raise
+
+        return val
+
     def filter(self, name, topic, payload):
         ''' Attempt to invoke function `name' from the `functions'
             package. Return that function's True/False '''
@@ -235,9 +256,10 @@ class PeriodicThread(object):
     Python periodic Thread using Timer with instant cancellation
     """
 
-    def __init__(self, callback=None, period=1, name=None, srv=None, *args, **kwargs):
+    def __init__(self, callback=None, period=1, name=None, srv=None, now=False, *args, **kwargs):
         self.name = name
         self.srv = srv
+        self.now = now
         self.args = args
         self.kwargs = kwargs
         self.callback = callback
@@ -250,6 +272,12 @@ class PeriodicThread(object):
         """
         Mimics Thread standard start method
         """
+
+        # Schedule periodic task to run right now
+        if self.now == True:
+            self.run()
+
+        # Schedule periodic task with designated interval
         self.schedule_timer()
 
     def run(self):
@@ -257,7 +285,7 @@ class PeriodicThread(object):
         By default run callback. Override it if you want to use inheritance
         """
         if self.callback is not None:
-            self.callback(srv)
+            self.callback(srv, *self.args, **self.kwargs)
 
     def _run(self):
         """
@@ -276,7 +304,7 @@ class PeriodicThread(object):
         """
         Schedules next Timer run
         """
-        self.current_timer = threading.Timer(self.period, self._run, *self.args, **self.kwargs)
+        self.current_timer = threading.Timer(self.period, self._run)
         if self.name:
             self.current_timer.name = self.name
         self.current_timer.start()
@@ -307,17 +335,21 @@ LOGFILE   = cf.logfile
 LOGFORMAT = cf.logformat
 
 # initialise logging
-logging.basicConfig(filename=LOGFILE, level=LOGLEVEL, format=LOGFORMAT)
+# Send log messages to sys.stderr by configuring "logfile = stream://sys.stderr"
+if LOGFILE.startswith('stream://'):
+    LOGFILE = LOGFILE.replace('stream://', '')
+    logging.basicConfig(stream=eval(LOGFILE), level=LOGLEVEL, format=LOGFORMAT)
+# Send log messages to file by configuring "logfile = 'mqttwarn.log'"
+else:
+    logging.basicConfig(filename=LOGFILE, level=LOGLEVEL, format=LOGFORMAT)
 logging.info("Starting %s" % SCRIPTNAME)
-logging.info("INFO MODE")
-logging.debug("DEBUG MODE")
+logging.info("Log level is %s" % logging.getLevelName(LOGLEVEL))
 
 # initialise MQTT broker connection
 mqttc = paho.Client(cf.clientid, clean_session=cf.cleansession, protocol=cf.protocol)
 
 # initialise processor queue
 q_in = Queue.Queue(maxsize=0)
-num_workers = 1
 exit_flag = False
 
 ptlist = {}         # List of PeriodicThread() objects
@@ -326,9 +358,19 @@ ptlist = {}         # List of PeriodicThread() objects
 # and its global instantiation
 class Service(object):
     def __init__(self, mqttc, logging):
+
+        # Reference to MQTT client object
         self.mqttc    = mqttc
+
+        # Reference to all mqttwarn globals, for using its machinery from plugins
+        self.mwcore   = globals()
+
+        # Reference to logging object
         self.logging  = logging
+
+        # Name of self ("mqttwarn", mostly)
         self.SCRIPTNAME = SCRIPTNAME
+
 srv = Service(None, None)
 
 service_plugins = {}
@@ -393,6 +435,40 @@ def get_config(section, name):
         value = cf.get(section, name)
     return value
 
+def asbool(obj):
+    """
+    Shamelessly stolen from beaker.converters
+    # (c) 2005 Ian Bicking and contributors; written for Paste (http://pythonpaste.org)
+    # Licensed under the MIT license: http://www.opensource.org/licenses/mit-license.php
+    """
+    if isinstance(obj, basestring):
+        obj = obj.strip().lower()
+        if obj in ['true', 'yes', 'on', 'y', 't', '1']:
+            return True
+        elif obj in ['false', 'no', 'off', 'n', 'f', '0']:
+            return False
+        else:
+            raise ValueError(
+                "String is not true/false: %r" % obj)
+    return bool(obj)
+
+def parse_cron_options(argstring):
+    """
+    Parse periodic task options.
+    Obtains configuration value, returns dictionary.
+
+    Example::
+
+        my_periodic_task = 60; now=true
+
+    """
+    parts = argstring.split(';')
+    options = {'interval': float(parts[0].strip())}
+    for part in parts[1:]:
+        name, value = part.split('=')
+        options[name.strip()] = value.strip()
+    return options
+
 def is_filtered(section, topic, payload):
     if cf.has_option(section, 'filter'):
         filterfunc = get_function_name( cf.get(section, 'filter') )
@@ -432,13 +508,28 @@ def get_all_data(section, topic, data):
             logging.warn("Cannot invoke alldata function %s defined in %s: %s" % (name, section, str(e)))
     return None
 
+def get_topic_targets(section, topic, data):
+    """
+    Topic targets function invoker.
+    """
+    if cf.has_option(section, 'targets'):
+        name = get_function_name(cf.get(section, 'targets'))
+        try:
+            return cf.topic_target_list(name, topic, data)
+        except Exception as ex:
+            error = repr(ex)
+            logging.warn('Error invoking topic targets function "{name}" ' \
+                         'defined in section "{section}": {error}'.format(**locals()))
+    return None
+
 class Job(object):
-    def __init__(self, prio, service, section, topic, payload, target):
+    def __init__(self, prio, service, section, topic, payload, data, target):
         self.prio       = prio
         self.service    = service
         self.section    = section
         self.topic      = topic
-        self.payload    = payload
+        self.payload    = payload       # raw payload
+        self.data       = data          # decoded payload
         self.target     = target
 
         logging.debug("New `%s:%s' job: %s" % (service, target, topic))
@@ -478,7 +569,8 @@ def on_connect(mosq, userdata, result_code):
             mqttc.subscribe(str(topic), qos)
             subscribed.append(topic)
 
-        mqttc.publish(cf.lwt, LWTALIVE, qos=0, retain=True)
+        if cf.lwt is not None:
+            mqttc.publish(cf.lwt, LWTALIVE, qos=0, retain=True)
 
     elif result_code == 1:
         logging.info("Connection refused - unacceptable protocol version")
@@ -541,8 +633,22 @@ def send_to_targets(section, topic, payload):
         logging.warn("Section [%s] does not exist in your INI file, skipping message on %s" % (section, topic))
         return
 
+    # decode raw payload into transformation data
+    data = decode_payload(section, topic, payload)
+
     dispatcher_dict = cf.getdict(section, 'targets')
-    if type(dispatcher_dict) == dict:
+    function_name = get_function_name(get_config(section, 'targets'))
+
+    if function_name is not None:
+        targetlist = get_topic_targets(section, topic, data)
+        targetlist_type = type(targetlist)
+        if targetlist_type is not types.ListType:
+            logging.error('Topic target definition by function "{function_name}" ' \
+                          'in section "{section}" is empty or incorrect. ' \
+                          'targetlist={targetlist}, type={targetlist_type}'.format(**locals()))
+            return
+
+    elif type(dispatcher_dict) == dict:
         def get_key(item):
             # precede a key with the number of topic levels and then use reverse alphabetic sort order
             # '+' is after '#' in ascii table
@@ -577,6 +683,19 @@ def send_to_targets(section, topic, payload):
             cleanup(0)
             return
 
+    # interpolate transformation data values into topic targets
+    # be graceful if interpolation fails, but log a meaningful message
+    targetlist_resolved = []
+    for target in targetlist:
+        try:
+            target = target.format(**data)
+            targetlist_resolved.append(target)
+        except Exception as ex:
+            error = repr(ex)
+            logging.error('Cannot interpolate transformation data into topic target "{target}": {error}. ' \
+                          'section={section}, topic={topic}, payload={payload}, data={data}'.format(**locals()))
+    targetlist = targetlist_resolved
+
     for t in targetlist:
         logging.debug("Message on %s going to %s" % (topic, t))
         # Each target is either "service" or "service:target"
@@ -592,9 +711,10 @@ def send_to_targets(section, topic, payload):
                 logging.warn("Invalid target %s - should be 'service:target'" % (t))
                 continue
 
+        # skip targets with invalid services
         if not service in service_plugins:
             logging.error("Invalid configuration: topic %s points to non-existing service %s" % (topic, service))
-            return
+            continue
 
         sendtos = None
         if target is None:
@@ -603,7 +723,7 @@ def send_to_targets(section, topic, payload):
             sendtos = [target]
 
         for sendto in sendtos:
-            job = Job(1, service, section, topic, payload, sendto)
+            job = Job(1, service, section, topic, payload, data, sendto)
             q_in.put(job)
 
 def builtin_transform_data(topic, payload):
@@ -665,80 +785,131 @@ def xform(function, orig_value, transform_data):
         try:
             res = function.format(**transform_data).encode('utf-8')
         except Exception, e:
-            pass
+            logging.warning("Cannot format message: %s" % e)
 
     if type(res) == str:
         res = res.replace("\\n", "\n")
     return res
 
-def processor():
+# http://code.activestate.com/recipes/473878-timeout-function-using-threading/
+def timeout(func, args=(), kwargs={}, timeout_secs=10, default=False):
+    import threading
+    class InterruptableThread(threading.Thread):
+        def __init__(self):
+            threading.Thread.__init__(self)
+            self.result = None
+
+        def run(self):
+            try:
+                self.result = func(*args, **kwargs)
+            except:
+                self.result = default
+
+    it = InterruptableThread()
+    it.start()
+    it.join(timeout_secs)
+    if it.isAlive():
+        return default
+    else:
+        return it.result
+
+def decode_payload(section, topic, payload):
+    """
+    Decode message payload through transformation machinery.
+    """
+
+    transform_data = builtin_transform_data(topic, payload)
+
+    topic_data = get_topic_data(section, topic)
+    if topic_data is not None and type(topic_data) == dict:
+        transform_data = dict(transform_data.items() + topic_data.items())
+
+    # The dict returned is completely merged into transformation data
+    # The difference between this and `get_topic_data()' is that this
+    # function obtains the topic string as well as the payload and any
+    # existing transformation data, and it can do 'things' with all.
+    # This is the way it should originally have been, but I can no
+    # longer fix the original ... (legacy)
+
+    all_data = get_all_data(section, topic, transform_data)
+    if all_data is not None and type(all_data) == dict:
+        transform_data = dict(transform_data.items() + all_data.items())
+
+    # Attempt to decode the payload from JSON. If it's possible, add
+    # the JSON keys into item to pass to the plugin, and create the
+    # outgoing (i.e. transformed) message.
+    try:
+        payload_data = json.loads(payload)
+        transform_data = dict(transform_data.items() + payload_data.items())
+    except Exception as ex:
+        logging.debug("Cannot decode JSON object, payload={payload}: {ex}".format(**locals()))
+
+    return transform_data
+
+def processor(worker_id=None):
     """
     Queue runner. Pull a job from the queue, find the module in charge
     of handling the service, and invoke the module's plugin to do so.
     """
 
     while not exit_flag:
-        job = q_in.get(15)
+        logging.debug('Job queue has %s items to process' % q_in.qsize())
+        job = q_in.get()
 
         service = job.service
         section = job.section
         target  = job.target
+        topic   = job.topic
 
-        logging.debug("Processor is handling: `%s' for %s" % (service, target))
+        logging.debug("Processor #%s is handling: `%s' for %s" % (worker_id, service, target))
 
-        item = {}
+        # sanity checks
+        # if service configuration or targets can not be obtained successfully,
+        # log a sensible error message, fail the job and carry on with the next job
         try:
-            item = {
-                'service'       : service,
-                'section'       : section,
-                'target'        : target,
-                'config'        : get_service_config(service),
-                'addrs'         : get_service_targets(service)[target],
-                'topic'         : job.topic,
-                'payload'       : job.payload,
-                'data'          : None,
-                'title'         : None,
-                'image'         : None,
-                'message'       : None,
-                'priority'      : None
-            }
+            service_config  = get_service_config(service)
+            service_targets = get_service_targets(service)
+
+            if target not in service_targets:
+                error_message = "Invalid configuration: topic {topic} points to " \
+                                "non-existing target {target} in service {service}".format(**locals())
+                raise KeyError(error_message)
+
         except Exception, e:
-            logging.error("Cannot handle service=%s, target=%s: %s" % (service, target, str(e)))
+            logging.error("Cannot handle service=%s, target=%s: %s" % (service, target, repr(e)))
             q_in.task_done()
-            return
+            continue
 
-        transform_data = builtin_transform_data(job.topic, job.payload)
+        item = {
+            'service'       : service,
+            'section'       : section,
+            'target'        : target,
+            'config'        : service_config,
+            'addrs'         : service_targets[target],
+            'topic'         : topic,
+            'payload'       : job.payload,
+            'data'          : None,
+            'title'         : None,
+            'image'         : None,
+            'message'       : None,
+            'priority'      : None
+        }
 
-        topic_data = get_topic_data(job.section, job.topic)
-        if topic_data is not None and type(topic_data) == dict:
-            transform_data = dict(transform_data.items() + topic_data.items())
-
-        # The dict returned is completely merged into transformation data
-        # The difference bewteen this and `get_topic_data()' is that this
-        # function obtains the topic string as well as the payload and any
-        # existing transformation data, and it can do 'things' with all.
-        # This is the way it should originally have been, but I can no
-        # longer fix the original ... (legacy)
-
-        all_data = get_all_data(job.section, job.topic, transform_data)
-        if all_data is not None and type(all_data) == dict:
-            transform_data = dict(transform_data.items() + all_data.items())
-
-        # Attempt to decode the payload from JSON. If it's possible, add
-        # the JSON keys into item to pass to the plugin, and create the
-        # outgoing (i.e. transformed) message.
-        try:
-            payload_data = json.loads(job.payload)
-            transform_data = dict(transform_data.items() + payload_data.items())
-        except:
-            pass
-
+        transform_data = job.data
         item['data'] = dict(transform_data.items())
 
         item['title'] = xform(get_config(section, 'title'), SCRIPTNAME, transform_data)
         item['image'] = xform(get_config(section, 'image'), '', transform_data)
         item['message'] = xform(get_config(section, 'format'), job.payload, transform_data)
-        item['priority'] = int(xform(get_config(section, 'priority'), 0, transform_data))
+
+        try:
+            item['priority'] = int(xform(get_config(section, 'priority'), 0, transform_data))
+        except Exception, e:
+            item['priority'] = 0
+            logging.warn("Failed to determine the priority, defaulting to zero: %s" % (str(e)))
+
+        if HAVE_JINJA is False and get_config(section, 'template'):
+            logging.warn("Templating not possible because Jinja2 is not installed")
 
         if HAVE_JINJA is True:
             template = get_config(section, 'template')
@@ -754,13 +925,14 @@ def processor():
             st = Struct(**item)
             notified = False
             try:
+                # fire the plugin in a separate thread and kill it if it doesn't return in 10s 
                 module = service_plugins[service]['module']
-                notified = module.plugin(srv, st)
+                notified = timeout(module.plugin, (srv, st))
             except Exception, e:
                 logging.error("Cannot invoke service for `%s': %s" % (service, str(e)))
 
             if not notified:
-                logging.warn("Notification of %s for `%s' FAILED" % (service, item.get('topic')))
+                logging.warn("Notification of %s for `%s' FAILED or TIMED OUT" % (service, item.get('topic')))
         else:
             logging.warn("Notification of %s for `%s' suppressed: text is empty" % (service, item.get('topic')))
 
@@ -832,8 +1004,9 @@ def connect():
         mqttc.username_pw_set(cf.username, cf.password)
 
     # set the lwt before connecting
-    logging.debug("Setting LWT to %s..." % (cf.lwt))
-    mqttc.will_set(cf.lwt, payload=LWTDEAD, qos=0, retain=True)
+    if cf.lwt is not None:
+        logging.debug("Setting LWT to %s..." % (cf.lwt))
+        mqttc.will_set(cf.lwt, payload=LWTDEAD, qos=0, retain=True)
 
     # Delays will be: 3, 6, 12, 24, 30, 30, ...
     # mqttc.reconnect_delay_set(delay=3, delay_max=30, exponential_backoff=True)
@@ -851,8 +1024,9 @@ def connect():
         sys.exit(2)
 
     # Launch worker threads to operate on queue
-    for i in range(num_workers):
-        t = threading.Thread(target=processor)
+    logging.info('Starting %s worker threads' % cf.num_workers)
+    for i in range(cf.num_workers):
+        t = threading.Thread(target=processor, kwargs={'worker_id': i})
         t.daemon = True
         t.start()
 
@@ -864,46 +1038,52 @@ def connect():
         for name, val in cf.items('cron'):
             try:
                 func = getattr(__import__(cf.functions, fromlist=[name]), name)
-                interval = float(val)
-                ptlist[name] = PeriodicThread(func, interval, srv=srv)
+                cron_options = parse_cron_options(val)
+                interval = cron_options['interval']
+                logging.debug('Scheduling function "{name}" as periodic task ' \
+                              'to run each {interval} seconds via [cron] section'.format(name=name, interval=interval))
+                ptlist[name] = PeriodicThread(callback=func, period=interval, name=name, srv=srv, now=asbool(cron_options.get('now')))
                 ptlist[name].start()
             except AttributeError:
                 logging.error("[cron] section has function [%s] specified, but that's not defined" % name)
                 continue
 
+    while not exit_flag:
+        reconnect_interval = 5
 
-
-    while True:
         try:
             mqttc.loop_forever()
         except socket.error:
-            logging.info("MQTT server disconnected; sleeping")
-            time.sleep(5)
+            pass
         except:
             # FIXME: add logging with trace
             raise
+
+        if not exit_flag:
+            logging.warning("MQTT server disconnected, trying to reconnect each %s seconds" % reconnect_interval)
+            time.sleep(reconnect_interval)
 
 def cleanup(signum=None, frame=None):
     """
     Signal handler to ensure we disconnect cleanly
     in the event of a SIGTERM or SIGINT.
     """
-
-    global exit_flag
-
-    exit_flag = True
-
     for ptname in ptlist:
         logging.debug("Cancel %s timer" % ptname)
         ptlist[ptname].cancel()
 
     logging.debug("Disconnecting from MQTT broker...")
-    mqttc.publish(cf.lwt, LWTDEAD, qos=0, retain=True)
+    if cf.lwt is not None:
+        mqttc.publish(cf.lwt, LWTDEAD, qos=0, retain=True)
     mqttc.loop_stop()
     mqttc.disconnect()
 
     logging.info("Waiting for queue to drain")
     q_in.join()
+
+    # Send exit signal to subsystems _after_ queue was drained
+    global exit_flag
+    exit_flag = True
 
     logging.debug("Exiting on signal %d", signum)
     sys.exit(signum)
