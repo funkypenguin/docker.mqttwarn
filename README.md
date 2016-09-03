@@ -1,5 +1,7 @@
 ## MQTTwarn image
 
+Based on the work of https://github.com/sourceperl/docker.mqttwarn, I simply forked so that I could have docker-hub auto-build me an image.
+
 Subscribe to MQTT topics (with wildcards) and notifiy pluggable services.  
 *Project from https://github.com/jpmens/mqttwarn.*
 
