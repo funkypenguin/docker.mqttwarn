@@ -2,6 +2,11 @@ FROM python:2.7
 
 MAINTAINER sourceperl <loic.celine@free.fr>
 
+# BUILD_DATE and VCS_REF are immaterial, since this is a 2-stage build, but our build
+# hook won't work unless we specify the args
+ARG BUILD_DATE
+ARG VCS_REF
+
 # build /opt/mqttwarn
 RUN mkdir -p /opt/mqttwarn
 RUN mkdir -p /opt/mqttwarn/conf
